@@ -1,13 +1,13 @@
 let video;
-let faceMesh;
-let faces = [];
 let bodySegmentation;
 let segmentation;
 let personMask;
 let asciiLayer;
 let glowLayer;
 let classifier;
-let classificationLabel = 'loading classifier...';
+let bodySegmentationReady = false;
+let classifierReady = false;
+let classificationLabel = 'empty';
 let candidateLabel = '';
 let candidateCount = 0;
 let transitionFrom = '';
@@ -19,7 +19,9 @@ let transitionStartedAt = 0;
 const W = 640;
 const H = 480;
 let fallbackTextAnchor = { x: W / 2, y: H * 0.36, width: W * 0.3 };
-const TM_MODEL_URL = 'https://teachablemachine.withgoogle.com/models/uWbtrf3Xp/model.json';
+// Your trained Teachable Machine classifier. ml5 resolves model.json,
+// metadata.json, and the weights from this project URL.
+const TM_MODEL_URL = 'https://teachablemachine.withgoogle.com/models/uWbtrf3Xp/';
 const ASCII_SIZE = 11;
 const EDGE_RADIUS = ASCII_SIZE * 0.72;
 const GAP_AMOUNT = 0.22;
@@ -32,31 +34,24 @@ const FACE_TEXT_LINE_HEIGHT = 30;
 const FILM_JITTER_INTERVAL_MIN = 380;
 const FILM_JITTER_INTERVAL_MAX = 1300;
 const FILM_JITTER_DISTANCE = 4;
-let filmJitter = { x: 0, y: 0, nextAt: 0 };
+const FILM_JITTER_HOLD_MS = 75;
+let filmJitter = { x: 0, y: 0, nextAt: 500, activeUntil: 0 };
 
 // Change only the text on the right to customize what each detected class says.
 const CLASS_TEXT = {
   'headless horse': 'One day I woke up, I lost my head',
-  'elephant head': 'ELEPHANT',
-  'snoopy head': 'SNOOPY',
+  'elephant head': 'I know it doesn\'t belong to me, but I didn\'t think it would dissapear so quickly.',
+  'snoopy head': 'I',
   'me': 'hold some object up',
-  'empty': 'hold some object up'
+  'empty': 'hold some object up',
+  'horse and elephant': 'HORSE + ELEPHANT',
+  'horse and dog': 'HORSE + SNOOPY'
 };
+const DEFAULT_TEXT = CLASS_TEXT.empty;
 
 function preload() {
-  // FaceMesh runs in the browser: no Roboflow key or cloud inference is used.
-  faceMesh = ml5.faceMesh({
-    maxFaces: 1,
-    refineLandmarks: false,
-    flipHorizontal: false
-  });
-
-  // This is the person/background mask, following the ml5 BodySegmentation example.
-  bodySegmentation = ml5.bodySegmentation('SelfieSegmentation', {
-    maskType: 'person'
-  });
-
-  classifier = ml5.imageClassifier(TM_MODEL_URL);
+  // Models are intentionally loaded after setup. A remote-model failure must
+  // not block p5 from creating the canvas and starting the webcam.
 }
 
 function setup() {
@@ -70,13 +65,55 @@ function setup() {
   glowLayer.pixelDensity(1);
   asciiLayer.textFont('monospace');
   asciiLayer.textAlign(CENTER, CENTER);
+  // Keep text visible even before the first classifier result arrives.
+  transitionFrom = DEFAULT_TEXT;
+  transitionTo = DEFAULT_TEXT;
 
-  video = createCapture({ video: { width: W, height: H }, audio: false });
+  video = createCapture(
+    { video: { width: W, height: H }, audio: false },
+    loadModelsIndependently
+  );
   video.size(W, H);
   video.hide();
+}
 
-  faceMesh.detectStart(video, gotFaces);
+function loadModelsIndependently() {
+  try {
+    bodySegmentation = ml5.bodySegmentation(
+      'SelfieSegmentation',
+      { maskType: 'person' },
+      gotBodySegmentationModel
+    );
+  } catch (error) {
+    console.error('BodySegmentation could not start:', error);
+  }
+
+  try {
+    classifier = ml5.imageClassifier(TM_MODEL_URL, gotClassifierModel);
+  } catch (error) {
+    console.error('Teachable Machine classifier could not start:', error);
+  }
+}
+
+function gotBodySegmentationModel(model, error) {
+  if (error) {
+    console.error('BodySegmentation model failed to load:', error);
+    return;
+  }
+
+  bodySegmentation = model || bodySegmentation;
+  bodySegmentationReady = true;
   bodySegmentation.detectStart(video, gotSegmentation);
+}
+
+function gotClassifierModel(model, error) {
+  if (error) {
+    console.error('Teachable Machine model failed to load:', error);
+    return;
+  }
+
+  classifier = model || classifier;
+  classifierReady = true;
   classifyVideo();
 }
 
@@ -100,12 +137,15 @@ function getCenteredTextAnchor() {
   if (millis() >= filmJitter.nextAt) {
     filmJitter.x = random(-FILM_JITTER_DISTANCE, FILM_JITTER_DISTANCE);
     filmJitter.y = random(-FILM_JITTER_DISTANCE, FILM_JITTER_DISTANCE);
+    filmJitter.activeUntil = millis() + FILM_JITTER_HOLD_MS;
     filmJitter.nextAt = millis() + random(FILM_JITTER_INTERVAL_MIN, FILM_JITTER_INTERVAL_MAX);
   }
 
+  const isJittering = millis() < filmJitter.activeUntil;
+
   return {
-    x: W * 0.5 + filmJitter.x,
-    y: H * 0.5 + filmJitter.y
+    x: W * 0.5 + (isJittering ? filmJitter.x : 0),
+    y: H * 0.5 + (isJittering ? filmJitter.y : 0)
   };
 }
 
@@ -250,6 +290,13 @@ function setTextTarget(nextText) {
   transitionStartedAt = millis();
 }
 
+function textForClass(label) {
+  // Teachable Machine labels may arrive with a trailing space or different
+  // capitalization. An unknown transient result must never erase the text.
+  const normalized = String(label || '').trim().toLowerCase();
+  return CLASS_TEXT[normalized] || transitionTo || DEFAULT_TEXT;
+}
+
 function renderFilteredAscii() {
   // The face text and ASCII contour share this blur-and-grain filter.
   glowLayer.clear();
@@ -285,12 +332,14 @@ function addGrain(layer, amount) {
     const alpha = layer.pixels[i + 3];
     if (alpha === 0) continue;
 
-    const grain = random(-amount, amount);
+    // Fixed per-pixel grain: it reads as texture rather than a full-screen
+    // flash caused by generating brand-new random noise every frame.
+    const grain = map(positionHash(i, 0, 721), 0, 1, -amount, amount);
     layer.pixels[i] = constrain(layer.pixels[i] + grain, 0, 255);
     layer.pixels[i + 1] = constrain(layer.pixels[i + 1] + grain, 0, 255);
     layer.pixels[i + 2] = constrain(layer.pixels[i + 2] + grain, 0, 255);
     layer.pixels[i + 3] = constrain(
-      alpha + random(-amount * 0.65, amount * 0.35),
+      alpha + map(positionHash(i, 0, 997), 0, 1, -amount * 0.65, amount * 0.35),
       0,
       255
     );
@@ -312,16 +361,8 @@ function positionHash(x, y, seed) {
   return value - floor(value);
 }
 
-function mirrored(point) {
-  // FaceMesh coordinates are in the 640×480 camera coordinate system.
-  return { x: W - point.x, y: point.y };
-}
-
-function gotFaces(results) {
-  faces = results || [];
-}
-
 function classifyVideo() {
+  if (!classifierReady || !classifier) return;
   classifier.classify(video, gotClassification);
 }
 
@@ -339,15 +380,15 @@ function gotClassification(firstArgument, secondArgument) {
 
     // Show the first valid classification immediately. After that, ignore
     // one-off flickers before starting another text transition.
-    const isFirstClassification = classificationLabel === 'loading classifier...';
+    const isFirstClassification = classificationLabel === 'empty' && transitionTo === DEFAULT_TEXT;
     if ((isFirstClassification || candidateCount >= 2) && nextLabel !== classificationLabel) {
       classificationLabel = nextLabel;
-      setTextTarget(CLASS_TEXT[classificationLabel] || '');
+      setTextTarget(textForClass(classificationLabel));
     }
   }
 
   // The classifier is only for debugging, so it does not need to run every frame.
-  setTimeout(classifyVideo, 150);
+  if (classifierReady) setTimeout(classifyVideo, 150);
 }
 
 function gotSegmentation(result) {
