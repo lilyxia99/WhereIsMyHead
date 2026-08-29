@@ -28,7 +28,7 @@ const GAP_AMOUNT = 0.22;
 const NOISE_AMOUNT = 34;
 const TEXT_TRANSITION_MS = 800;
 const FACE_TEXT_SIZE = 24;
-const FACE_TEXT_BOX_WIDTH = 170;
+const FACE_TEXT_BOX_WIDTH = 500;
 const FACE_TEXT_LINE_HEIGHT = 30;
 // A brief, irregular offset makes the centered type feel like a loose film frame.
 const FILM_JITTER_INTERVAL_MIN = 380;
@@ -39,13 +39,13 @@ let filmJitter = { x: 0, y: 0, nextAt: 500, activeUntil: 0 };
 
 // Change only the text on the right to customize what each detected class says.
 const CLASS_TEXT = {
-  'headless horse': 'One day I woke up, I lost my head',
-  'elephant head': 'I know it doesn\'t belong to me, but I didn\'t think it would dissapear so quickly.',
-  'snoopy head': 'I',
+  'headless horse': 'One day I woke up, I lost my head. \nI started to run, but I didn\'t know where to go.',
+  'elephant head': 'I know my head doesn\'t belong to me, but I didn\'t think it would dissapear so quickly.',
+  'snoopy head': 'I used to really like snoopy. He is such a cool dog. I didn\'t know that he is a beagle, and I heard that a lot of beagles are being used as experiment animals, because they are way too kind even if people pierce needles on them.',
   'me': 'hold some object up',
   'empty': 'hold some object up',
   'horse and elephant': 'HORSE + ELEPHANT',
-  'horse and dog': 'HORSE + SNOOPY'
+  'horse and dog': 'I used to really like snoopy. He is such a cool dog. I didn\'t know that he is a beagle, and I heard that a lot of beagles are being used as experiment animals, because they are way too kind even if people pierce needles on them.'
 };
 const DEFAULT_TEXT = CLASS_TEXT.empty;
 
@@ -207,7 +207,7 @@ function drawFaceText(faceCenter) {
   asciiLayer.noStroke();
   asciiLayer.fill(255);
   asciiLayer.textFont('monospace');
-  asciiLayer.textAlign(LEFT, CENTER);
+  asciiLayer.textAlign(CENTER, CENTER);
   asciiLayer.textSize(FACE_TEXT_SIZE);
 
   const charWidth = asciiLayer.textWidth('M');
@@ -215,13 +215,15 @@ function drawFaceText(faceCenter) {
   const lines = wrapCharacters(chars, maxColumns);
   const blockHeight = lines.length * FACE_TEXT_LINE_HEIGHT;
   const startY = faceCenter.y - blockHeight * 0.5 + FACE_TEXT_LINE_HEIGHT * 0.5;
-  const startX = faceCenter.x - FACE_TEXT_BOX_WIDTH * 0.5;
 
   lines.forEach((line, lineIndex) => {
     line.forEach((char, charIndex) => {
+      // Center every wrapped line independently inside the text box.
+      const centeredCharacterX =
+        faceCenter.x + (charIndex - (line.length - 1) * 0.5) * charWidth;
       asciiLayer.text(
         char,
-        startX + charIndex * charWidth,
+        centeredCharacterX,
         startY + lineIndex * FACE_TEXT_LINE_HEIGHT
       );
     });
@@ -250,7 +252,11 @@ function wrapCharacters(chars, maxColumns) {
   }
 
   chars.forEach(char => {
-    if (char === ' ') {
+    if (char === '\n') {
+      placeWord();
+      lines.push(line);
+      line = [];
+    } else if (char === ' ') {
       placeWord();
     } else {
       word.push(char);
